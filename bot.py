@@ -3,9 +3,11 @@ import io
 import json
 import math
 import os
-import sqlite3
 import threading
 import time
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 import telebot
 from telebot import apihelper, types
 from flask import Flask
@@ -15,7 +17,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is alive and running 24/7!"
+    return "Bot is alive and connected to Cloud PostgreSQL!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -26,25 +28,25 @@ def keep_alive():
     t.start()
 # -------------------------------------------------------------
 
-TOKEN = "7959977846:AAEHAi6gP3tP6oWefIX6DovDp6Nl2NqLCyk"       # يفضل تغييره من BotFather للأمان
-ADMIN_ID = 6704551303      # رقم الآيدي الخاص بك
+TOKEN = os.environ.get("BOT_TOKEN", "7959977846:AAEHAi6gP3tP6oWefIX6DovDp6Nl2NqLCyk")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "6704551303"))
 
-# تفعيل معالجة الخيوط المتعددة وزيادة مهلة الاتصال لتحمل الضغط
+# ضع رابط قاعدة بيانات PostgreSQL من موقع Neon أو Supabase هنا (أو في إعدادات Render)
+DATABASE_URL = os.environ.get("DATABASE_URL", "ضع_رابط_قاعدة_البيانات_هنا")
+
 apihelper.ENABLE_MIDDLEWARE = False
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=16)
 
-DB_PATH = "bot_database.db"
 OLD_JSON_PATH = "data.json"
 VIDEOS_PER_PAGE = 5
-USER_COOLDOWN = 5       # أقل فاصل زمني بالثواني بين طلبات المستخدم
-SUB_CACHE_TTL = 30      # مدة حفظ حالة الاشتراك الإجباري في الذاكرة (بالثواني)
+USER_COOLDOWN = 5
+SUB_CACHE_TTL = 30
 
-# أقفال لمنع تضارب العمليات عند الضغط المتزامن
-db_write_lock = threading.Lock()
 user_action_locks = {}
 user_locks_guard = threading.Lock()
 user_cooldowns = {}
-sub_cache = {}  # {user_id: (is_ok, missing_list, expire_time)}
+sub_cache = {}
+db_pool = None
 
 ADMIN_BUTTONS = {
     "📢 إذاعة للكل", "📊 الإحصائيات", "✅ فك حظر", "🚫 حظر",
@@ -55,7 +57,6 @@ ADMIN_BUTTONS = {
 }
 
 
-# --- الحصول على قفل خاص بكل مستخدم لمنع الضغط المزدوج ---
 def get_user_lock(user_id):
     with user_locks_guard:
         if user_id not in user_action_locks:
@@ -63,32 +64,47 @@ def get_user_lock(user_id):
         return user_action_locks[user_id]
 
 
-# --- إدارة قاعدة البيانات SQLite عالية الأداء (WAL Mode) ---
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+# --- إدارة الاتصال السحابي بقاعدة بيانات PostgreSQL ---
+def init_pool():
+    global db_pool
+    db_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=15,
+        dsn=DATABASE_URL
+    )
+
+
+class DBContext:
+    def __enter__(self):
+        self.conn = db_pool.getconn()
+        self.cur = self.conn.cursor(cursor_factory=RealDictCursor)
+        return self.cur
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.cur.close()
+        db_pool.putconn(self.conn)
 
 
 def init_db():
-    with db_write_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.executescript("""
+    init_pool()
+    with DBContext() as cur:
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 is_banned INTEGER DEFAULT 0,
                 is_admin INTEGER DEFAULT 0,
-                joined_at REAL
+                joined_at DOUBLE PRECISION
             );
             CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 file_id TEXT NOT NULL,
                 caption TEXT DEFAULT ''
             );
@@ -98,10 +114,10 @@ def init_db():
                 title TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS pending_deletes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
                 message_ids TEXT NOT NULL,
-                delete_at REAL NOT NULL,
+                delete_at DOUBLE PRECISION NOT NULL,
                 page_num INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_delete_at ON pending_deletes(delete_at);
@@ -112,106 +128,100 @@ def init_db():
             "delete_after": "60"
         }
         for k, v in defaults.items():
-            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-        conn.commit()
-        conn.close()
-
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+                (k, v)
+            )
     migrate_from_old_json()
 
 
 def migrate_from_old_json():
-    """نقل البيانات تلقائياً من ملف data.json القديم إلى SQLite إن وجد"""
+    """نقل البيانات تلقائياً من ملف data.json القديم إلى السحابة إن وجد"""
     if not os.path.exists(OLD_JSON_PATH):
         return
     try:
         with open(OLD_JSON_PATH, "r", encoding="utf-8") as f:
             old = json.load(f)
-        with db_write_lock:
-            conn = get_conn()
-            cur = conn.cursor()
+        with DBContext() as cur:
             if "welcome_msg" in old:
-                cur.execute("UPDATE settings SET value=? WHERE key='welcome_msg'", (old["welcome_msg"],))
+                cur.execute("UPDATE settings SET value=%s WHERE key='welcome_msg'", (old["welcome_msg"],))
             if "delete_after" in old:
-                cur.execute("UPDATE settings SET value=? WHERE key='delete_after'", (str(old["delete_after"]),))
+                cur.execute("UPDATE settings SET value=%s WHERE key='delete_after'", (str(old["delete_after"]),))
             if "bot_active" in old:
-                cur.execute("UPDATE settings SET value=? WHERE key='bot_active'", ("1" if old["bot_active"] else "0",))
+                cur.execute("UPDATE settings SET value=%s WHERE key='bot_active'", ("1" if old["bot_active"] else "0",))
 
             for uid in old.get("users", []):
-                cur.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (int(uid), time.time()))
+                cur.execute("INSERT INTO users (user_id, joined_at) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (int(uid), time.time()))
             for uid in old.get("banned", []):
-                cur.execute("INSERT INTO users (user_id, is_banned, joined_at) VALUES (?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET is_banned=1", (int(uid), time.time()))
+                cur.execute("INSERT INTO users (user_id, is_banned, joined_at) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET is_banned=1", (int(uid), time.time()))
             for uid in old.get("admins", []):
-                cur.execute("INSERT INTO users (user_id, is_admin, joined_at) VALUES (?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET is_admin=1", (int(uid), time.time()))
+                cur.execute("INSERT INTO users (user_id, is_admin, joined_at) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET is_admin=1", (int(uid), time.time()))
             for vid in old.get("videos", []):
-                cur.execute("INSERT INTO videos (file_id, caption) VALUES (?, ?)", (vid["file_id"], vid.get("caption", "")))
+                cur.execute("INSERT INTO videos (file_id, caption) VALUES (%s, %s)", (vid["file_id"], vid.get("caption", "")))
             for ch in old.get("force_sub", []):
                 if isinstance(ch, dict):
-                    cur.execute("INSERT OR IGNORE INTO force_sub (chat_id, url, title) VALUES (?, ?, ?)", (str(ch["chat_id"]), ch["url"], ch["title"]))
-            conn.commit()
-            conn.close()
+                    cur.execute("INSERT INTO force_sub (chat_id, url, title) VALUES (%s, %s, %s) ON CONFLICT (chat_id) DO NOTHING", (str(ch["chat_id"]), ch["url"], ch["title"]))
         os.rename(OLD_JSON_PATH, OLD_JSON_PATH + ".bak")
-        print("[System] تم نقل البيانات القديمة إلى قاعدة البيانات بنجاح.")
+        print("[System] تم نقل البيانات القديمة إلى السحابة بنجاح.")
     except Exception as e:
         print(f"[Migration Warning]: {e}")
 
 
 # --- دوال مساعدة لقاعدة البيانات ---
 def get_setting(key, default=""):
-    conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else default
+    with DBContext() as cur:
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else default
 
 
 def set_setting(key, value):
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (key, str(value))
+        )
 
 
 def register_user(user_id):
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (int(user_id), time.time()))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, joined_at) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (int(user_id), time.time())
+        )
 
 
 def is_banned(user_id):
     if is_admin(user_id):
         return False
-    conn = get_conn()
-    row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (int(user_id),)).fetchone()
-    conn.close()
-    return bool(row and row["is_banned"] == 1)
+    with DBContext() as cur:
+        cur.execute("SELECT is_banned FROM users WHERE user_id=%s", (int(user_id),))
+        row = cur.fetchone()
+        return bool(row and row["is_banned"] == 1)
 
 
 def is_admin(user_id):
     if int(user_id) == int(ADMIN_ID):
         return True
-    conn = get_conn()
-    row = conn.execute("SELECT is_admin FROM users WHERE user_id=?", (int(user_id),)).fetchone()
-    conn.close()
-    return bool(row and row["is_admin"] == 1)
+    with DBContext() as cur:
+        cur.execute("SELECT is_admin FROM users WHERE user_id=%s", (int(user_id),))
+        row = cur.fetchone()
+        return bool(row and row["is_admin"] == 1)
 
 
 def get_all_videos():
-    conn = get_conn()
-    rows = conn.execute("SELECT id, file_id, caption FROM videos ORDER BY id ASC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with DBContext() as cur:
+        cur.execute("SELECT id, file_id, caption FROM videos ORDER BY id ASC")
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_all_force_sub():
-    conn = get_conn()
-    rows = conn.execute("SELECT chat_id, url, title FROM force_sub").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with DBContext() as cur:
+        cur.execute("SELECT chat_id, url, title FROM force_sub")
+        return [dict(r) for r in cur.fetchall()]
 
 
-# --- منع الإغراق (Rate Limiting) ---
+# --- منع الإغراق ---
 def check_rate_limit(user_id):
     if is_admin(user_id):
         return False
@@ -223,7 +233,7 @@ def check_rate_limit(user_id):
     return False
 
 
-# --- مقاطعة الخطوات عند ضغط الأوامر أو أزرار اللوحة ---
+# --- مقاطعة الخطوات ---
 def check_interrupt(message):
     if not message.text:
         return False
@@ -238,7 +248,7 @@ def check_interrupt(message):
     return False
 
 
-# --- إرسال آمن ضد حظر تيليجرام المؤقت (FloodWait Safe Send) ---
+# --- إرسال آمن ---
 def safe_api_call(func, *args, **kwargs):
     for _ in range(3):
         try:
@@ -252,7 +262,7 @@ def safe_api_call(func, *args, **kwargs):
     return None
 
 
-# --- فحص الاشتراك الإجباري مع التخزين المؤقت (Cache) ---
+# --- فحص الاشتراك الإجباري ---
 def check_sub(user_id, force_test=False, bypass_cache=False):
     if is_admin(user_id) and not force_test:
         return True, [], None
@@ -321,25 +331,25 @@ def send_pages_menu(chat_id, custom_prefix=""):
     safe_api_call(bot.send_message, chat_id, text, parse_mode="HTML", reply_markup=pages_inline_markup())
 
 
-# --- طابور الحذف المستمر المدعوم بـ SQLite ---
+# --- طابور الحذف السحابي المستمر ---
 def enqueue_delete(chat_id, message_ids, delay, page_num):
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO pending_deletes (chat_id, message_ids, delete_at, page_num) VALUES (?, ?, ?, ?)",
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO pending_deletes (chat_id, message_ids, delete_at, page_num) VALUES (%s, %s, %s, %s)",
             (chat_id, json.dumps(message_ids), time.time() + delay, page_num)
         )
-        conn.commit()
-        conn.close()
 
 
 def background_cleaner_worker():
     while True:
         try:
             now = time.time()
-            conn = get_conn()
-            tasks = conn.execute("SELECT id, chat_id, message_ids, page_num FROM pending_deletes WHERE delete_at <= ? LIMIT 50", (now,)).fetchall()
-            conn.close()
+            with DBContext() as cur:
+                cur.execute(
+                    "SELECT id, chat_id, message_ids, page_num FROM pending_deletes WHERE delete_at <= %s LIMIT 50",
+                    (now,)
+                )
+                tasks = cur.fetchall()
 
             for task in tasks:
                 mids = json.loads(task["message_ids"])
@@ -356,14 +366,11 @@ def background_cleaner_worker():
                 except Exception:
                     pass
 
-                with db_write_lock:
-                    conn = get_conn()
-                    conn.execute("DELETE FROM pending_deletes WHERE id=?", (task["id"],))
-                    conn.commit()
-                    conn.close()
+                with DBContext() as cur:
+                    cur.execute("DELETE FROM pending_deletes WHERE id=%s", (task["id"],))
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(2.0)
 
 
 # --- إرسال صفحة الفيديوهات ---
@@ -450,7 +457,7 @@ def start_and_admin_cmd(message):
         safe_api_call(
             bot.send_message,
             chat_id,
-            "⚙️ <b>أهلاً بك في لوحة الأدمن!</b>\nالأزرار جاهزة بالأسفل للتحكم الكامل:",
+            "⚙️ <b>أهلاً بك في لوحة الأدمن (Cloud DB)!</b>\nالأزرار جاهزة بالأسفل للتحكم الكامل:",
             parse_mode="HTML",
             reply_markup=admin_reply_keyboard()
         )
@@ -643,19 +650,24 @@ def handle_admin_buttons(message):
         bot.send_message(chat_id, "⚙️ تم الرجوع للوحة الأدمن:", reply_markup=admin_reply_keyboard())
 
     elif text == "📊 الإحصائيات":
-        conn = get_conn()
-        u_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        b_count = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        a_count = conn.execute("SELECT COUNT(*) FROM users WHERE is_admin=1").fetchone()[0] + 1
-        v_count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        f_count = conn.execute("SELECT COUNT(*) FROM force_sub").fetchone()[0]
-        p_count = conn.execute("SELECT COUNT(*) FROM pending_deletes").fetchone()[0]
-        conn.close()
+        with DBContext() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM users")
+            u_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM users WHERE is_banned=1")
+            b_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM users WHERE is_admin=1")
+            a_count = cur.fetchone()["c"] + 1
+            cur.execute("SELECT COUNT(*) AS c FROM videos")
+            v_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM force_sub")
+            f_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM pending_deletes")
+            p_count = cur.fetchone()["c"]
 
         status_txt = "يعمل ✅" if get_setting("bot_active", "1") == "1" else "متوقف (صيانة) 🔴"
         total_p = math.ceil(v_count / VIDEOS_PER_PAGE) if v_count else 0
         msg = (
-            f"📊 <b>إحصائيات البوت (SQLite High-Load):</b>\n\n"
+            f"📊 <b>إحصائيات البوت (Cloud PostgreSQL):</b>\n\n"
             f"👥 إجمالي المستخدمين: <code>{u_count}</code>\n"
             f"🎬 الفيديوهات المحفوظة: <code>{v_count}</code> (<code>{total_p}</code> صفحات)\n"
             f"⏳ مهام الحذف النشطة حالياً: <code>{p_count}</code>\n"
@@ -671,7 +683,7 @@ def handle_admin_buttons(message):
         v_count = len(get_all_videos())
         msg = bot.send_message(
             chat_id,
-            f"🎬 أرسل الآن <b>الفيديو</b> لحفظه في البوت (الحالي: <code>{v_count}</code>):",
+            f"🎬 أرسل الآن <b>الفيديو</b> لحفظه في السحابة (الحالي: <code>{v_count}</code>):",
             parse_mode="HTML",
             reply_markup=cancel_reply_keyboard()
         )
@@ -712,9 +724,9 @@ def handle_admin_buttons(message):
         bot.register_next_step_handler(msg, step_get_target_user)
 
     elif text == "📄 تصدير المستخدمين":
-        conn = get_conn()
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-        conn.close()
+        with DBContext() as cur:
+            cur.execute("SELECT user_id FROM users")
+            rows = cur.fetchall()
         if not rows:
             bot.send_message(chat_id, "❌ لا يوجد مستخدمين لتصديرهم حالياً.", reply_markup=admin_reply_keyboard())
             return
@@ -743,9 +755,9 @@ def handle_admin_buttons(message):
         )
 
     elif text == "👮‍♂️ الأدمنية":
-        conn = get_conn()
-        admins = conn.execute("SELECT user_id FROM users WHERE is_admin=1").fetchall()
-        conn.close()
+        with DBContext() as cur:
+            cur.execute("SELECT user_id FROM users WHERE is_admin=1")
+            admins = cur.fetchall()
         admins_list = "\n".join(str(a["user_id"]) for a in admins) if admins else "لا يوجد أدمنية إضافيين."
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
@@ -786,13 +798,11 @@ def admin_inline_callbacks(call):
     if call.data.startswith("adm_approve_vid_"):
         sender_id = int(call.data.split("_")[-1])
         if call.message.video:
-            with db_write_lock:
-                conn = get_conn()
-                conn.execute("INSERT INTO videos (file_id, caption) VALUES (?, ?)", (call.message.video.file_id, ""))
-                total_v = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-                conn.commit()
-                conn.close()
-            bot.answer_callback_query(call.id, "✅ تم نشر الفيديو في البوت!", show_alert=True)
+            with DBContext() as cur:
+                cur.execute("INSERT INTO videos (file_id, caption) VALUES (%s, %s)", (call.message.video.file_id, ""))
+                cur.execute("SELECT COUNT(*) AS c FROM videos")
+                total_v = cur.fetchone()["c"]
+            bot.answer_callback_query(call.id, "✅ تم نشر الفيديو في السحابة!", show_alert=True)
             bot.edit_message_caption(
                 f"✅ <b>تم قبول ونشر هذا الفيديو!</b> (الإجمالي: <code>{total_v}</code>)",
                 chat_id,
@@ -817,11 +827,8 @@ def admin_inline_callbacks(call):
 
     if call.data.startswith("adm_del_id_"):
         vid_db_id = int(call.data.split("_")[-1])
-        with db_write_lock:
-            conn = get_conn()
-            conn.execute("DELETE FROM videos WHERE id=?", (vid_db_id,))
-            conn.commit()
-            conn.close()
+        with DBContext() as cur:
+            cur.execute("DELETE FROM videos WHERE id=%s", (vid_db_id,))
 
         videos = get_all_videos()
         if not videos:
@@ -837,11 +844,8 @@ def admin_inline_callbacks(call):
         bot.edit_message_text(f"🗑 <b>المتبقي ({len(videos)}):</b>", chat_id, msg_id, parse_mode="HTML", reply_markup=kb)
 
     elif call.data == "adm_clear_all_videos":
-        with db_write_lock:
-            conn = get_conn()
-            conn.execute("DELETE FROM videos")
-            conn.commit()
-            conn.close()
+        with DBContext() as cur:
+            cur.execute("DELETE FROM videos")
         bot.edit_message_text("🔥 تم مسح جميع الفيديوهات بنجاح.", chat_id, msg_id)
 
     elif call.data == "adm_fsub_add":
@@ -865,11 +869,8 @@ def admin_inline_callbacks(call):
 
     elif call.data.startswith("adm_fsub_rm_"):
         target_cid = call.data.replace("adm_fsub_rm_", "")
-        with db_write_lock:
-            conn = get_conn()
-            conn.execute("DELETE FROM force_sub WHERE chat_id=?", (target_cid,))
-            conn.commit()
-            conn.close()
+        with DBContext() as cur:
+            cur.execute("DELETE FROM force_sub WHERE chat_id=%s", (target_cid,))
         sub_cache.clear()
         bot.edit_message_text("✅ تم حذف القناة من الاشتراك الإجباري.", chat_id, msg_id)
 
@@ -934,16 +935,14 @@ def step_add_video(message):
         bot.register_next_step_handler(msg, step_add_video)
         return
 
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT INTO videos (file_id, caption) VALUES (?, ?)", (message.video.file_id, message.caption or ""))
-        total_v = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute("INSERT INTO videos (file_id, caption) VALUES (%s, %s)", (message.video.file_id, message.caption or ""))
+        cur.execute("SELECT COUNT(*) AS c FROM videos")
+        total_v = cur.fetchone()["c"]
 
     msg = bot.send_message(
         message.chat.id,
-        f"✅ تم الحفظ! (الإجمالي: <code>{total_v}</code>)\nأرسل فيديو آخر أو اضغط إلغاء:",
+        f"✅ تم الحفظ في السحابة! (الإجمالي: <code>{total_v}</code>)\nأرسل فيديو آخر أو اضغط إلغاء:",
         parse_mode="HTML",
         reply_markup=cancel_reply_keyboard()
     )
@@ -965,9 +964,9 @@ def step_broadcast(message):
         return
 
     def _run_broadcast():
-        conn = get_conn()
-        rows = conn.execute("SELECT user_id FROM users WHERE is_banned=0").fetchall()
-        conn.close()
+        with DBContext() as cur:
+            cur.execute("SELECT user_id FROM users WHERE is_banned=0")
+            rows = cur.fetchall()
         sent, failed = 0, 0
         status_msg = bot.send_message(message.chat.id, f"⏳ جاري الإرسال إلى {len(rows)} مستخدم في الخلفية...")
         for r in rows:
@@ -996,11 +995,11 @@ def step_ban(message):
     if uid == int(ADMIN_ID):
         bot.send_message(message.chat.id, "❌ لا يمكنك حظر المالك.", reply_markup=admin_reply_keyboard())
         return
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT INTO users (user_id, is_banned, joined_at) VALUES (?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET is_banned=1", (uid, time.time()))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, is_banned, joined_at) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET is_banned=1",
+            (uid, time.time())
+        )
     bot.send_message(message.chat.id, f"🚫 تم حظر {uid}.", reply_markup=admin_reply_keyboard())
 
 
@@ -1011,11 +1010,8 @@ def step_unban(message):
         bot.send_message(message.chat.id, "❌ أرسل آيدي رقمي صحيح.", reply_markup=admin_reply_keyboard())
         return
     uid = int(message.text)
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute("UPDATE users SET is_banned=0 WHERE user_id=%s", (uid,))
     bot.send_message(message.chat.id, f"✅ تم فك الحظر عن {uid}.", reply_markup=admin_reply_keyboard())
 
 
@@ -1026,9 +1022,9 @@ def step_user_info(message):
         bot.send_message(message.chat.id, "❌ أرسل آيدي رقمي صحيح.", reply_markup=admin_reply_keyboard())
         return
     uid = int(message.text)
-    conn = get_conn()
-    row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (uid,)).fetchone()
-    conn.close()
+    with DBContext() as cur:
+        cur.execute("SELECT is_banned FROM users WHERE user_id=%s", (uid,))
+        row = cur.fetchone()
     in_db = "نعم ✅" if row else "لا ❌"
     banned_txt = "نعم 🚫" if (row and row["is_banned"] == 1) else "لا ✅"
     try:
@@ -1105,11 +1101,11 @@ def step_fsub_add_id(message):
         bot.send_message(message.chat.id, f"❌ تعذر الوصول للقناة {ch}!", reply_markup=admin_reply_keyboard())
         return
 
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT OR REPLACE INTO force_sub (chat_id, url, title) VALUES (?, ?, ?)", (ch, f"https://t.me/{ch.replace('@', '')}", ch_title))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO force_sub (chat_id, url, title) VALUES (%s, %s, %s) ON CONFLICT (chat_id) DO UPDATE SET url=EXCLUDED.url, title=EXCLUDED.title",
+            (ch, f"https://t.me/{ch.replace('@', '')}", ch_title)
+        )
     sub_cache.clear()
     bot.send_message(message.chat.id, f"✅ تم إضافة <b>{html.escape(ch_title)}</b> بنجاح!", parse_mode="HTML", reply_markup=admin_reply_keyboard())
 
@@ -1122,11 +1118,11 @@ def step_fsub_add_private_url(message, target_chat, ch_title):
         bot.register_next_step_handler(msg, step_fsub_add_private_url, target_chat, ch_title)
         return
 
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT OR REPLACE INTO force_sub (chat_id, url, title) VALUES (?, ?, ?)", (target_chat, message.text.strip(), ch_title))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO force_sub (chat_id, url, title) VALUES (%s, %s, %s) ON CONFLICT (chat_id) DO UPDATE SET url=EXCLUDED.url, title=EXCLUDED.title",
+            (target_chat, message.text.strip(), ch_title)
+        )
     sub_cache.clear()
     bot.send_message(message.chat.id, f"✅ تم إضافة القناة الخاصة <b>{html.escape(ch_title)}</b> بنجاح!", parse_mode="HTML", reply_markup=admin_reply_keyboard())
 
@@ -1137,11 +1133,11 @@ def step_admin_add(message):
     if not message.text or not message.text.isdigit():
         return
     uid = int(message.text)
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("INSERT INTO users (user_id, is_admin, joined_at) VALUES (?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET is_admin=1", (uid, time.time()))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, is_admin, joined_at) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET is_admin=1",
+            (uid, time.time())
+        )
     bot.send_message(message.chat.id, f"✅ تم رفع {uid} أدمن.", reply_markup=admin_reply_keyboard())
 
 
@@ -1151,11 +1147,8 @@ def step_admin_del(message):
     if not message.text or not message.text.isdigit():
         return
     uid = int(message.text)
-    with db_write_lock:
-        conn = get_conn()
-        conn.execute("UPDATE users SET is_admin=0 WHERE user_id=?", (uid,))
-        conn.commit()
-        conn.close()
+    with DBContext() as cur:
+        cur.execute("UPDATE users SET is_admin=0 WHERE user_id=%s", (uid,))
     bot.send_message(message.chat.id, f"➖ تم تنزيل {uid}.", reply_markup=admin_reply_keyboard())
 
 
@@ -1167,10 +1160,10 @@ def step_set_welcome(message):
 
 
 if __name__ == "__main__":
-    keep_alive()  # تشغيل السيرفر الوهمي في الخلفية لـ Render
+    keep_alive()
     init_db()
     threading.Thread(target=background_cleaner_worker, daemon=True).start()
-    print("High-Concurrency Secured Bot is running...")
+    print("Cloud PostgreSQL High-Concurrency Bot is running...")
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
